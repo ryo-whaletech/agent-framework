@@ -288,6 +288,37 @@ async def test_post_run_http_error(mock_http_client):
             pass
 
 
+@pytest.mark.parametrize("status_code", [401, 403, 429, 500])
+@pytest.mark.parametrize("preloaded", [False, True], ids=["streamed", "preloaded"])
+async def test_post_run_preserves_http_status_error(status_code, preloaded, caplog):
+    """Logging must not replace an HTTP status error or read its response body."""
+    body = b'{"error":"request rejected"}'
+    response = (
+        httpx.Response(status_code, content=body)
+        if preloaded
+        else httpx.Response(status_code, stream=httpx.ByteStream(body))
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AGUIHttpService("https://agui.example.test/run", http_client=client)
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            _ = [event async for event in service.post_run(thread_id="t1", run_id="r1", messages=[])]
+
+        assert caught.value.response is response
+        assert caught.value.response.status_code == status_code
+        assert caught.value.request.method == "POST"
+        assert str(caught.value.request.url) == "https://agui.example.test/run"
+        assert response.is_closed
+        assert not client.is_closed
+        if not preloaded:
+            assert not response.is_stream_consumed
+
+    assert f"HTTP request failed: {status_code}" in caplog.text
+
+
 async def test_post_run_invalid_json(mock_http_client):
     """Test handling of invalid JSON in SSE stream."""
     invalid_sse = "data: {invalid json}\n\ndata: " + json.dumps({"type": "RUN_FINISHED"}) + "\n"

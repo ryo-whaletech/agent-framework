@@ -32,6 +32,28 @@ from agent_framework_ag_ui._event_converters import AGUIEventConverter
 from agent_framework_ag_ui._http_service import AGUIHttpService
 
 
+@pytest.mark.parametrize("mode", ["aggregated", "streaming", "final-response"])
+async def test_public_client_preserves_streamed_http_status_error(mode: str):
+    """A rejected run must expose the HTTP failure through each public consumption path."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, stream=httpx.ByteStream(b'{"error":"unauthorized"}'))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        async with AGUIChatClient(endpoint="https://agui.example.test/run", http_client=http_client) as client:
+            messages = [Message(role="user", contents=["Hello"])]
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                if mode == "streaming":
+                    _ = [update async for update in client.get_response(messages, stream=True)]
+                elif mode == "final-response":
+                    await client.get_response(messages, stream=True).get_final_response()
+                else:
+                    await client.get_response(messages)
+
+            assert caught.value.response.status_code == 401
+            assert not caught.value.response.is_stream_consumed
+
+
 class StubAGUIChatClient(AGUIChatClient):
     """Testable wrapper exposing protected helpers."""
 

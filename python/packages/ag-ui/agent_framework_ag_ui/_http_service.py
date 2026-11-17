@@ -264,7 +264,7 @@ class AGUIHttpService:
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP request failed: {e.response.status_code} - {e.response.text}")
+                logger.error("HTTP request failed: %s", e.response.status_code)
                 raise
 
             async for line in response.aiter_lines():
