@@ -2,13 +2,17 @@
 
 """Tests for AGUIHttpService."""
 
+import copy
 import json
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
-from ag_ui.core import Interrupt, ResumeEntry
+from ag_ui.core import Interrupt, ResumeEntry, RunAgentInput
+from agent_framework import Message, WorkflowBuilder, WorkflowContext, executor
+from fastapi import FastAPI
 
+from agent_framework_ag_ui import add_agent_framework_fastapi_endpoint
 from agent_framework_ag_ui._http_service import AGUIHttpService
 
 
@@ -329,6 +333,79 @@ async def test_post_run_accepts_data_lines_without_space(sample_events):
         events = [event async for event in service.post_run(thread_id="thread_123", run_id="run_456", messages=[])]
 
     assert events == sample_events
+
+
+@pytest.mark.parametrize(
+    "state", [None, {}, {"counter": 1, "nested": {"value": None}}], ids=["no-state", "empty-state", "state"]
+)
+@pytest.mark.parametrize(
+    "tools",
+    [None, [], [{"name": "lookup", "description": "Look up an item", "parameters": {"type": "object"}}]],
+    ids=["unspecified-tools", "empty-tools", "tool"],
+)
+async def test_post_run_sends_required_run_input_defaults(state, tools):
+    """Default calls must validate as official run inputs without losing supplied values."""
+    received: list[RunAgentInput] = []
+    expected_state = copy.deepcopy(state)
+    expected_tools = copy.deepcopy(tools)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        validated = RunAgentInput.model_validate(payload)
+        assert "state" in payload
+        received.append(validated)
+        assert validated.thread_id == "thread-1" and validated.run_id == "run-1"
+        assert validated.messages == []
+        assert validated.state == expected_state
+        assert [tool.model_dump() for tool in validated.tools] == (expected_tools if expected_tools is not None else [])
+        assert validated.context == [] and validated.forwarded_props is None
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"type":"RUN_FINISHED","threadId":"thread-1","runId":"run-1"}\n\n',
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = AGUIHttpService("https://agui.example.test/run", http_client=client)
+        events = [
+            event
+            async for event in service.post_run(
+                thread_id="thread-1", run_id="run-1", messages=[], state=state, tools=tools
+            )
+        ]
+
+    assert len(received) == 1
+    assert state == expected_state and tools == expected_tools
+    assert events == [{"type": "RUN_FINISHED", "threadId": "thread-1", "runId": "run-1"}]
+
+
+async def test_post_run_preserves_workflow_invocation_defaults():
+    """Default requests must not inject empty forwarded properties into workflow execution."""
+
+    @executor(id="echo")
+    async def echo(messages: list[Message], ctx: WorkflowContext[None, str]) -> None:
+        await ctx.yield_output(messages[-1].text)
+
+    workflow = WorkflowBuilder(start_executor=echo).build()
+    app = FastAPI()
+    add_agent_framework_fastapi_endpoint(app, workflow, path="/run", single_user=True, keepalive_seconds=None)
+
+    with patch.object(workflow, "run", wraps=workflow.run) as run:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as client:
+            service = AGUIHttpService("https://agui.example.test/run", http_client=client)
+            events = [
+                event
+                async for event in service.post_run(
+                    thread_id="thread-1",
+                    run_id="run-1",
+                    messages=[{"id": "m1", "role": "user", "content": "Hello"}],
+                )
+            ]
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert not any(event["type"] == "RUN_ERROR" for event in events)
+    run.assert_called_once()
+    assert "function_invocation_kwargs" not in run.call_args.kwargs
 
 
 async def test_context_manager():

@@ -187,8 +187,8 @@ class AGUIHttpService:
             thread_id: Thread identifier for conversation continuity
             run_id: Unique run identifier
             messages: List of messages in AG-UI format
-            state: Optional state object to send to server
-            tools: Optional list of tools available to the agent
+            state: Optional state object to send to server. Sent as null when omitted.
+            tools: Optional list of tools available to the agent. Sent as an empty list when omitted.
             available_interrupts: Optional list of interrupt descriptors available for resumption
             resume: Optional resume payload to continue a paused run
 
@@ -212,18 +212,16 @@ class AGUIHttpService:
                     if event["type"] == "TEXT_MESSAGE_CONTENT":
                         print(event["delta"])
         """
-        # Build request payload
+        # Keep required RunAgentInput fields present without inventing state or forwarded properties.
         request_data: dict[str, Any] = {
             "thread_id": thread_id,
             "run_id": run_id,
             "messages": messages,
+            "state": state,
+            "tools": tools if tools is not None else [],
+            "context": [],
+            "forwardedProps": None,
         }
-
-        if state is not None:
-            request_data["state"] = state
-
-        if tools is not None:
-            request_data["tools"] = tools
 
         serialized_available_interrupts = _serialize_available_interrupts(available_interrupts)
         if serialized_available_interrupts is not None:

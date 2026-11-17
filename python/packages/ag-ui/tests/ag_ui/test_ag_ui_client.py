@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
-from ag_ui.core import Interrupt, ResumeEntry
+from ag_ui.core import Interrupt, ResumeEntry, RunAgentInput
 from agent_framework import (
     Agent,
     AgentResponseUpdate,
@@ -25,7 +25,9 @@ from agent_framework import (
     ResponseStream,
     tool,
 )
+from fastapi import FastAPI
 from pytest import MonkeyPatch
+from starlette.responses import StreamingResponse
 
 from agent_framework_ag_ui._client import AGUIChatClient
 from agent_framework_ag_ui._event_converters import AGUIEventConverter
@@ -677,7 +679,7 @@ class TestAGUIChatClient:
             )
 
         assert response is not None
-        assert "state" not in captured_request
+        assert captured_request["state"] is None
         assert captured_request["messages"] == [
             {
                 "id": "msg-json-document",
@@ -722,7 +724,7 @@ class TestAGUIChatClient:
             response = await client.inner_get_response(messages=[message], options={})
 
         assert response is not None
-        assert "state" not in captured_request
+        assert captured_request["state"] is None
         assert captured_request["messages"] == [
             {
                 "id": "msg-json-only-document",
@@ -2143,3 +2145,39 @@ class TestAGUIChatClient:
         )
 
         assert response is not None
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "streaming", "final-response"])
+async def test_public_client_calls_server_validating_official_run_input(mode: str):
+    """A default request must work with an endpoint using the official input model."""
+    app = FastAPI()
+    received: list[RunAgentInput] = []
+
+    @app.post("/run")
+    async def run(input_data: RunAgentInput):
+        received.append(input_data)
+        events = [
+            {"type": "RUN_STARTED", "threadId": input_data.thread_id, "runId": input_data.run_id},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Hello"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m1"},
+            {"type": "RUN_FINISHED", "threadId": input_data.thread_id, "runId": input_data.run_id},
+        ]
+        return StreamingResponse(
+            iter(f"data: {json.dumps(event)}\n\n" for event in events), media_type="text/event-stream"
+        )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app)) as http_client:
+        async with AGUIChatClient(endpoint="https://agui.example.test/run", http_client=http_client) as client:
+            messages = [Message(role="user", contents=["Hello"])]
+            if mode == "streaming":
+                text = "".join([update.text async for update in client.get_response(messages, stream=True)])
+            elif mode == "final-response":
+                text = (await client.get_response(messages, stream=True).get_final_response()).text
+            else:
+                text = (await client.get_response(messages)).text
+
+    assert text == "Hello"
+    assert len(received) == 1
+    assert received[0].state is None and received[0].forwarded_props is None
+    assert received[0].tools == [] and received[0].context == []
